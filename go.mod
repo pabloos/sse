@@ -1,4 +1,4 @@
-module github.com/pabloos/sse/v2
+module github.com/pabloos/sse
 
 go 1.13
 
