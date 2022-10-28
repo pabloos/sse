@@ -6,115 +6,128 @@ package sse
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 )
 
-// ServeHTTP serves new connections with events for a given stream ...
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	flusher, err := w.(http.Flusher)
-	if !err {
-		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
-		return
-	}
+type ExtractFunc func(*http.Request) (string, error)
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	for k, v := range s.Headers {
-		w.Header().Set(k, v)
-	}
-
-	// Get the StreamID from the URL
-	streamID := r.URL.Query().Get("stream")
+func DefaultExtraction(req *http.Request) (string, error) {
+	streamID := req.URL.Query().Get("stream")
 	if streamID == "" {
-		http.Error(w, "Please specify a stream!", http.StatusInternalServerError)
-		return
+		return "", errors.New("Please specify a stream!")
 	}
 
-	stream := s.getStream(streamID)
+	return streamID, nil
+}
 
-	if stream == nil {
-		if !s.AutoStream {
-			http.Error(w, "Stream not found!", http.StatusInternalServerError)
+// ServeHTTP serves new connections with events for a given stream ...
+func (s *Server) Handler(extractID ExtractFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 			return
 		}
 
-		stream = s.CreateStream(streamID)
-	}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
 
-	eventid := 0
-	if id := r.Header.Get("Last-Event-ID"); id != "" {
-		var err error
-		eventid, err = strconv.Atoi(id)
+		for k, v := range s.Headers {
+			w.Header().Set(k, v)
+		}
+
+		streamID, err := extractID(r)
 		if err != nil {
-			http.Error(w, "Last-Event-ID must be a number!", http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-	}
 
-	// Create the stream subscriber
-	sub := stream.addSubscriber(eventid, r.URL)
+		stream := s.getStream(streamID)
 
-	go func() {
-		<-r.Context().Done()
-
-		sub.close()
-
-		if s.AutoStream && !s.AutoReplay && stream.getSubscriberCount() == 0 {
-			s.RemoveStream(streamID)
-		}
-	}()
-
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	// Push events to client
-	for ev := range sub.connection {
-		// If the data buffer is an empty string abort.
-		if len(ev.Data) == 0 && len(ev.Comment) == 0 {
-			break
-		}
-
-		// if the event has expired, dont send it
-		if s.EventTTL != 0 && time.Now().After(ev.timestamp.Add(s.EventTTL)) {
-			continue
-		}
-
-		if len(ev.Data) > 0 {
-			fmt.Fprintf(w, "id: %s\n", ev.ID)
-
-			if s.SplitData {
-				sd := bytes.Split(ev.Data, []byte("\n"))
-				for i := range sd {
-					fmt.Fprintf(w, "data: %s\n", sd[i])
-				}
-			} else {
-				if bytes.HasPrefix(ev.Data, []byte(":")) {
-					fmt.Fprintf(w, "%s\n", ev.Data)
-				} else {
-					fmt.Fprintf(w, "data: %s\n", ev.Data)
-				}
+		if stream == nil {
+			if !s.AutoStream {
+				http.Error(w, "Stream not found!", http.StatusInternalServerError)
+				return
 			}
 
-			if len(ev.Event) > 0 {
-				fmt.Fprintf(w, "event: %s\n", ev.Event)
-			}
+			stream = s.CreateStream(streamID)
+		}
 
-			if len(ev.Retry) > 0 {
-				fmt.Fprintf(w, "retry: %s\n", ev.Retry)
+		eventid := 0
+		if id := r.Header.Get("Last-Event-ID"); id != "" {
+			var err error
+			eventid, err = strconv.Atoi(id)
+			if err != nil {
+				http.Error(w, "Last-Event-ID must be a number!", http.StatusBadRequest)
+				return
 			}
 		}
 
-		if len(ev.Comment) > 0 {
-			fmt.Fprintf(w, ": %s\n", ev.Comment)
-		}
+		// Create the stream subscriber
+		sub := stream.addSubscriber(eventid, r.URL)
 
-		fmt.Fprint(w, "\n")
+		go func() {
+			<-r.Context().Done()
 
+			sub.close()
+
+			if s.AutoStream && !s.AutoReplay && stream.getSubscriberCount() == 0 {
+				s.RemoveStream(streamID)
+			}
+		}()
+
+		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
-	}
+
+		// Push events to client
+		for ev := range sub.connection {
+			// If the data buffer is an empty string abort.
+			if len(ev.Data) == 0 && len(ev.Comment) == 0 {
+				break
+			}
+
+			// if the event has expired, dont send it
+			if s.EventTTL != 0 && time.Now().After(ev.timestamp.Add(s.EventTTL)) {
+				continue
+			}
+
+			if len(ev.Data) > 0 {
+				fmt.Fprintf(w, "id: %s\n", ev.ID)
+
+				if s.SplitData {
+					sd := bytes.Split(ev.Data, []byte("\n"))
+					for i := range sd {
+						fmt.Fprintf(w, "data: %s\n", sd[i])
+					}
+				} else {
+					if bytes.HasPrefix(ev.Data, []byte(":")) {
+						fmt.Fprintf(w, "%s\n", ev.Data)
+					} else {
+						fmt.Fprintf(w, "data: %s\n", ev.Data)
+					}
+				}
+
+				if len(ev.Event) > 0 {
+					fmt.Fprintf(w, "event: %s\n", ev.Event)
+				}
+
+				if len(ev.Retry) > 0 {
+					fmt.Fprintf(w, "retry: %s\n", ev.Retry)
+				}
+			}
+
+			if len(ev.Comment) > 0 {
+				fmt.Fprintf(w, ": %s\n", ev.Comment)
+			}
+
+			fmt.Fprint(w, "\n")
+
+			flusher.Flush()
+		}
+	})
 }
